@@ -1,0 +1,1059 @@
+import { Types } from "mongoose";
+import crypto from "crypto";
+import { decryptCardCode, encryptCardCode } from "../utils/cardCodeCrypto.js";
+
+import Card from "../models/card.model.js";
+import CardTier from "../models/cardTier.model.js";
+import CustomPricing from "../models/customPricing.model.js";
+import Discount from "../models/discount.model.js";
+import Order from "../models/order.model.js";
+import Setting from "../models/setting.model.js";
+import Transaction from "../models/transaction.model.js";
+import User from "../models/user.model.js";
+import { placeAndResolveBambooOrder } from "../services/bambooCard.js";
+
+import { handleError } from "../utils/errorHandler.js";
+import { recordCardSale } from "../utils/statsTracker.js";
+import { withTransaction } from "../utils/dbTransaction.js";
+import {
+  getEffectiveBuyPrice,
+  getTierPriceForUser,
+} from "../utils/priceCalculator.js";
+import parsePagination from "../utils/parsePagination.js";
+import generateRandomSerialNumber from "../utils/generateRandomSerialNumber.js";
+import { isSandboxMode } from "../utils/sandbox.js";
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const buildUserSearchFilter = (searchTerm) => {
+  const term = searchTerm.trim();
+  const terms = term.split(/\s+/);
+
+  const patterns = new Set();
+  const addPattern = (item) => {
+    const trimmed = item.trim();
+    if (!trimmed) return;
+    patterns.add(escapeRegex(trimmed));
+  };
+
+  addPattern(term);
+  terms.forEach(addPattern);
+
+  const orConditions = [];
+  for (const pattern of patterns) {
+    const regex = new RegExp(pattern, "i");
+    orConditions.push({ name: regex }, { phone: regex });
+  }
+
+  return orConditions.length > 0 ? { $or: orConditions } : {};
+};
+
+const normalizeDate = (value, isEnd) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  if (typeof value === "string" && value.length <= 10) {
+    if (isEnd) {
+      parsed.setHours(23, 59, 59, 999);
+    } else {
+      parsed.setHours(0, 0, 0, 0);
+    }
+  }
+
+  return parsed;
+};
+
+const parseAmount = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? null : parsed;
+};
+
+const SANDBOX_CARD_CODE_LENGTH = 12;
+const SANDBOX_TOPUP_AMOUNT = 1000;
+const isSandbox = isSandboxMode();
+
+const hashCardCode = (value) =>
+  crypto.createHash("sha256").update(value).digest("hex");
+
+const generateSandboxCardCode = () => {
+  let code = "";
+  while (code.length < SANDBOX_CARD_CODE_LENGTH) {
+    const bytes = crypto.randomBytes(SANDBOX_CARD_CODE_LENGTH);
+    for (const byte of bytes) {
+      if (code.length >= SANDBOX_CARD_CODE_LENGTH) {
+        break;
+      }
+      code += (byte % 10).toString();
+    }
+  }
+  return code;
+};
+
+const normalizeOptionalDate = (value) => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null || value === "") {
+    return null;
+  }
+
+  const parsedDate = new Date(value);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return { error: true };
+  }
+
+  return parsedDate;
+};
+
+const withDecryptedCode = (card) => {
+  const data = card;
+  data.code = decryptCardCode(data.code);
+  return data;
+};
+
+const CHECKOUT_KEY_MIN_LENGTH = 8;
+const CHECKOUT_KEY_MAX_LENGTH = 100;
+
+// Upper bounds on what a single checkout request may ask for. Neither is a
+// pricing rule - they exist so one request can't fan out into an unbounded
+// number of per-item database round-trips / provider orders.
+const MAX_CHECKOUT_ITEMS = 50;
+const MAX_ITEM_QUANTITY = 100;
+
+const isValidCheckoutKey = (value) =>
+  typeof value === "string" &&
+  value.trim().length >= CHECKOUT_KEY_MIN_LENGTH &&
+  value.length <= CHECKOUT_KEY_MAX_LENGTH;
+
+const populateOrderQuery = (query) =>
+  query.populate([
+    {
+      path: "items.cards",
+      model: "Card",
+    },
+    {
+      path: "items.tierId",
+      model: "CardTier",
+      populate: {
+        path: "typeId",
+        model: "CardType",
+      },
+    },
+  ]);
+
+const getTierFromOrderItem = (item) =>
+  item?.tierId && typeof item.tierId === "object" ? item.tierId : null;
+
+const serializeOrderItemTier = (item, type) =>
+  item?.tierId
+    ? {
+        _id: item.tierId._id,
+        typeId: type
+          ? {
+              _id: type._id,
+              name: type.name,
+              redeemFormat: type.redeemFormat ?? null,
+              image: type.image ?? null,
+              printImage: type.printImage ?? null,
+              showExpiryDateDay: type.showExpiryDateDay ?? null,
+            }
+          : null,
+      }
+    : null;
+
+const serializeOrderItem = (item, { includeCards = false } = {}) => {
+  const tier = getTierFromOrderItem(item);
+  const type =
+    tier?.typeId && typeof tier.typeId === "object" ? tier.typeId : null;
+  const cards = Array.isArray(item?.cards) ? item.cards : [];
+
+  const payload = {
+    tierId: serializeOrderItemTier(item, type),
+    title: tier?.title ?? item?.title ?? null,
+    price: item?.price,
+    quantity: item?.quantity,
+  };
+
+  if (includeCards) {
+    payload.cards = cards.map((card) => {
+      if (!card || typeof card !== "object") {
+        return card ? { _id: card } : card;
+      }
+
+      const decryptedCode = card.code
+        ? decryptCardCode(card.code)
+        : (card.code ?? null);
+
+      return {
+        _id: card._id,
+        serialNumber: card.serialNumber ?? null,
+        code: decryptedCode,
+        pin: card.pin ?? null,
+        expiryDate: card.expiryDate ?? null,
+        redeemFormat: type?.redeemFormat || null,
+      };
+    });
+  }
+
+  return payload;
+};
+
+const findDuplicateCodeInType = async (tierId, codeHash, excludeCardId) => {
+  const tier = await CardTier.findById(tierId).select("typeId");
+  if (!tier) {
+    return null;
+  }
+
+  const relatedTierIds = await CardTier.find({
+    typeId: tier.typeId,
+  }).select("_id");
+
+  return Card.findOne({
+    ...(excludeCardId ? { _id: { $ne: excludeCardId } } : {}),
+    tierId: { $in: relatedTierIds.map((item) => item._id) },
+    codeHash,
+  });
+};
+
+const createSandboxCardDocument = async ({ tierId, userId }) => {
+  if (!userId) {
+    throw Object.assign(new Error("CARD_SOLD_USER_REQUIRED"), {
+      code: "CARD_SOLD_USER_REQUIRED",
+    });
+  }
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const code = generateSandboxCardCode();
+    const codeHash = hashCardCode(code);
+    const duplicate = await findDuplicateCodeInType(tierId, codeHash);
+    if (duplicate) {
+      continue;
+    }
+
+    for (let serialAttempt = 0; serialAttempt < 5; serialAttempt += 1) {
+      const card = new Card({
+        tierId,
+        serialNumber: generateRandomSerialNumber(),
+        code: encryptCardCode(code),
+        codeHash,
+        soldTo: userId,
+        soldAt: new Date(),
+      });
+
+      try {
+        await card.save();
+        return card;
+      } catch (err) {
+        if (err?.code === 11000) {
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  throw Object.assign(new Error("CARD_SANDBOX_CREATE_FAILED"), {
+    code: "CARD_SANDBOX_CREATE_FAILED",
+  });
+};
+
+const createExternalCardDocument = async ({
+  tierId,
+  userId,
+  bambooCard,
+  bambooOrderId,
+}) => {
+  if (!userId) {
+    throw Object.assign(new Error("CARD_SOLD_USER_REQUIRED"), {
+      code: "CARD_SOLD_USER_REQUIRED",
+    });
+  }
+  const code = bambooCard?.code?.trim();
+  if (!code) {
+    throw Object.assign(new Error("CARD_CODE_MISSING"), {
+      code: "CARD_CODE_MISSING",
+    });
+  }
+
+  const codeHash = hashCardCode(code);
+  const duplicate = await findDuplicateCodeInType(tierId, codeHash);
+  if (duplicate) {
+    throw Object.assign(new Error("CARD_CODE_DUPLICATE"), {
+      code: "CARD_CODE_DUPLICATE",
+    });
+  }
+
+  const externalSerialNumber = bambooCard?.serialNumber?.trim() || null;
+  const externalPin =
+    bambooCard?.pin === undefined || bambooCard?.pin === null
+      ? null
+      : String(bambooCard.pin).trim() || null;
+  const externalExpiryDate = normalizeOptionalDate(bambooCard?.expiryDate);
+  if (externalExpiryDate && externalExpiryDate.error) {
+    throw Object.assign(new Error("CARD_EXPIRY_DATE_INVALID"), {
+      code: "CARD_EXPIRY_DATE_INVALID",
+    });
+  }
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const cardPayload = {
+      tierId,
+      serialNumber: generateRandomSerialNumber(),
+      code: encryptCardCode(code),
+      codeHash,
+      pin: externalPin,
+      expiryDate: externalExpiryDate,
+      externalSerialNumber,
+      externalOrderId: bambooOrderId ?? null,
+      soldTo: userId,
+      soldAt: new Date(),
+    };
+
+    const card = new Card(cardPayload);
+
+    try {
+      await card.save();
+      return card;
+    } catch (err) {
+      if (err?.code === 11000) {
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw Object.assign(new Error("CARD_SERIAL_NUMBER_TAKEN"), {
+    code: "CARD_SERIAL_NUMBER_TAKEN",
+  });
+};
+
+const buildCheckoutSuccessResponse = async (orderDoc, balance) => {
+  const cardIds = (orderDoc.items || []).flatMap((item) =>
+    (item.cards || []).map((card) => (card && card._id ? card._id : card)),
+  );
+  const cards = await Card.find({ _id: { $in: cardIds } });
+  const purchasedCards = cards.map((card) => {
+    const { provider, externalSerialNumber, externalOrderId, ...rest } =
+      card.toObject();
+    return withDecryptedCode(rest);
+  });
+
+  const populatedOrder = await populateOrderQuery(
+    Order.findById(orderDoc._id),
+  );
+
+  const serializedOrder = {
+    ...populatedOrder.toObject(),
+    items: Array.isArray(populatedOrder.items)
+      ? populatedOrder.items.map((item) => {
+          const { provider, externalOrderId, cards: _cards, ...rest } =
+            item.toObject();
+          return { ...serializeOrderItem(rest) };
+        })
+      : [],
+  };
+
+  return {
+    cards: purchasedCards,
+    order: serializedOrder,
+    balance,
+    partialFailure: false,
+    failedItems: [],
+  };
+};
+
+export const checkoutCart = async (req, res) => {
+  req.logAction("checkout", { userId: req.user?.id });
+  const reservedCardIds = [];
+  const sandboxCreatedIdSet = new Set();
+  // Flipped once the buyer's wallet has been debited - see releaseReservedCards.
+  let checkoutCommitted = false;
+
+  const trackReserved = (cards) => {
+    for (let card of cards) {
+      const cardId = card._id;
+      reservedCardIds.push(cardId);
+      if (isSandbox) {
+        sandboxCreatedIdSet.add(String(cardId));
+      }
+    }
+  };
+
+  const releaseReservedCards = async () => {
+    // Once the wallet has actually been charged the cards belong to the buyer.
+    // A later failure (e.g. writing the transaction record) must not hand them
+    // back to the pool, which would leave the buyer paid-but-empty-handed and
+    // the same cards free to be sold to somebody else.
+    if (checkoutCommitted) return;
+    if (reservedCardIds.length === 0) return;
+
+    if (isSandbox && sandboxCreatedIdSet.size > 0) {
+      await Card.deleteMany({
+        _id: { $in: [...sandboxCreatedIdSet] },
+      });
+    }
+
+    const remainingIds = reservedCardIds.filter(
+      (id) => !sandboxCreatedIdSet.has(String(id)),
+    );
+    if (remainingIds.length === 0) return;
+
+    await Card.updateMany(
+      { _id: { $in: remainingIds } },
+      { soldTo: null, soldAt: null },
+    );
+  };
+
+  const cancelCheckout = async (
+    details,
+    code = "CART_AVAILABILITY_CHANGED",
+  ) => {
+    try {
+      await releaseReservedCards();
+    } catch (releaseError) {
+      // Best effort rollback before sending the cancellation response.
+    }
+    return res.status(409).json({ code, details });
+  };
+
+  try {
+    const { items } = req.body;
+
+    if (!req.user) {
+      return res.status(403).json({ code: "AUTH_USER_REQUIRED" });
+    }
+
+    if (!isValidCheckoutKey(req.body.checkoutKey)) {
+      return res.status(400).json({ code: "CHECKOUT_KEY_REQUIRED" });
+    }
+    const checkoutKey = req.body.checkoutKey.trim();
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ code: "CART_ITEMS_REQUIRED" });
+    }
+    if (items.length > MAX_CHECKOUT_ITEMS) {
+      return res.status(400).json({ code: "CART_TOO_MANY_ITEMS" });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ code: "USER_NOT_FOUND" });
+    }
+    if (user.isActive === false) {
+      return res.status(403).json({ code: "USER_INACTIVE" });
+    }
+    if (user.canBuy === false) {
+      return res.status(403).json({ code: "USER_CANNOT_BUY" });
+    }
+
+    // Idempotency fast path: if this exact checkout attempt already went
+    // through (e.g. the client retried after a lost response), replay the
+    // original result instead of charging the user a second time.
+    const existingOrder = await Order.findOne({
+      userId: user._id,
+      checkoutKey,
+    });
+    if (existingOrder) {
+      const payload = await buildCheckoutSuccessResponse(
+        existingOrder,
+        user.balance,
+      );
+      return res.status(201).json(payload);
+    }
+
+    // Helper to avoid floating-point rounding issues for currency (cents precision)
+    const roundToCents = (v) =>
+      Math.round((Number(v) + Number.EPSILON) * 100) / 100;
+
+    // Fetch dollarRate setting for calculating effective buyPrice
+    const dollarRateSetting = await Setting.findOne({
+      key: "سعر الدولار",
+    }).select("value");
+    const dollarRate = Number(dollarRateSetting?.value) || 1;
+
+    const requestedItems = [];
+    const availabilityIssues = [];
+    let totalCost = 0;
+
+    // Step 1: validate items, check local-only stock, and compute total price
+    for (const item of items) {
+      const tierId = item?.tierId;
+
+      // Quantity must be a whole number. A fractional quantity used to be
+      // accepted and silently under-charged the buyer: the price is computed
+      // as buyPrice * quantity, but the reservation loop (`i < quantity`)
+      // hands out Math.ceil(quantity) cards - so quantity 1.0001 charged for
+      // one card and delivered two.
+      const rawQuantity = item?.quantity;
+      const requested =
+        rawQuantity === undefined || rawQuantity === null || rawQuantity === ""
+          ? 1
+          : Number(rawQuantity);
+      if (!Number.isInteger(requested) || requested < 1) {
+        return res.status(400).json({ code: "CART_QUANTITY_INVALID" });
+      }
+      if (requested > MAX_ITEM_QUANTITY) {
+        return res.status(400).json({ code: "CART_QUANTITY_TOO_LARGE" });
+      }
+
+      if (!Types.ObjectId.isValid(tierId)) {
+        return res.status(400).json({ code: "CARD_TIER_ID_INVALID" });
+      }
+
+      const tier = await CardTier.findById(tierId).populate({
+        path: "typeId",
+        select: "fulfillmentSource name isActive",
+      });
+      if (!tier) {
+        return res.status(404).json({ code: "CARD_TIER_NOT_FOUND", tierId });
+      }
+      if (tier.isActive === false || tier.isAvailable === false) {
+        availabilityIssues.push({ tierId, requested, available: 0 });
+        continue;
+      }
+
+      const fulfillmentSource = tier.typeId?.fulfillmentSource || "local";
+      if (fulfillmentSource === "local" && !isSandbox) {
+        const localAvailable = await Card.countDocuments({
+          tierId,
+          soldTo: null,
+        });
+        if (localAvailable < requested) {
+          availabilityIssues.push({
+            tierId,
+            requested,
+            available: localAvailable,
+          });
+          continue;
+        }
+      }
+
+      const customPriceRecord =
+        user.role === "individual"
+          ? null
+          : await CustomPricing.findOne({
+              userId: user._id,
+              tierId,
+            });
+
+      // Discounts only ever apply to individual pricing - skip the lookup
+      // entirely for business users.
+      const discountRecord =
+        user.role === "individual"
+          ? await Discount.findOne({ tierId, isActive: true }).select(
+              "percentage",
+            )
+          : null;
+
+      const buyPrice = getTierPriceForUser({
+        userRole: user.role,
+        buyPrice: tier.buyPrice,
+        buyPriceUsd: tier.buyPriceUsd,
+        sellPrice: tier.sellPrice,
+        customBuyPrice: customPriceRecord?.buyPrice,
+        customBuyPriceUsd: customPriceRecord?.buyPriceUsd,
+        dollarRate,
+        discountPercentage: discountRecord?.percentage,
+      });
+
+      if (Number.isNaN(buyPrice) || buyPrice <= 0) {
+        return res.status(400).json({ code: "CARD_TIER_PRICE_INVALID" });
+      }
+
+      totalCost = roundToCents(totalCost + buyPrice * requested);
+
+      requestedItems.push({
+        tierId,
+        typeId: tier.typeId?._id || tier.typeId,
+        tierTitle: tier.title,
+        buyPrice,
+        requested,
+        fulfillmentSource,
+        bambooProductId: tier.bambooProductId || "",
+        bambooValue: tier.value,
+      });
+    }
+
+    if (availabilityIssues.length > 0) {
+      return res.status(409).json({
+        code: "CART_AVAILABILITY_CHANGED",
+        details: availabilityIssues,
+      });
+    }
+
+    // Step 2: ensure user balance covers the full checkout
+    if (user.balance < totalCost) {
+      if (isSandbox) {
+        while (user.balance < totalCost) {
+          const balanceBefore = roundToCents(user.balance);
+          const balanceAfter = roundToCents(balanceBefore + SANDBOX_TOPUP_AMOUNT);
+          user.balance = balanceAfter;
+
+          const deposit = new Transaction({
+            userId: user._id,
+            type: "deposit",
+            amount: SANDBOX_TOPUP_AMOUNT,
+            balanceBefore,
+            balanceAfter,
+          });
+          await deposit.save();
+        }
+        await user.save();
+      }
+      if (user.balance < totalCost) {
+        return res.status(400).json({ code: "USER_BALANCE_INSUFFICIENT" });
+      }
+    }
+
+    const reserveLocalCards = async (tierId, quantity) => {
+      const reserved = [];
+      const soldAt = new Date();
+
+      for (let i = 0; i < quantity; i += 1) {
+        const card = await Card.findOneAndUpdate(
+          { tierId, soldTo: null },
+          { soldTo: user._id, soldAt },
+          { returnDocument: "after", sort: { createdAt: 1 } },
+        );
+        if (!card) {
+          break;
+        }
+        reserved.push(card);
+      }
+
+      return reserved;
+    };
+
+    const orderItems = [];
+    const failureDetails = [];
+
+    if (isSandbox) {
+      for (const item of requestedItems) {
+        const createdCards = [];
+        for (let i = 0; i < item.requested; i += 1) {
+          const createdCard = await createSandboxCardDocument({
+            tierId: item.tierId,
+            userId: user._id,
+          });
+          createdCards.push(createdCard);
+          trackReserved([createdCard]);
+        }
+
+        orderItems.push({
+          tierId: item.tierId,
+          price: item.buyPrice,
+          quantity: item.requested,
+          externalOrderId: null,
+          cards: createdCards.map((card) => card._id),
+        });
+      }
+    } else {
+      // Step 3: reserve local-only items (must fully succeed or cancel)
+      for (const item of requestedItems.filter(
+        (entry) => entry.fulfillmentSource === "local",
+      )) {
+        const reserved = await reserveLocalCards(item.tierId, item.requested);
+        trackReserved(reserved);
+
+        if (reserved.length < item.requested) {
+          failureDetails.push({
+            tierId: item.tierId,
+            requested: item.requested,
+            available: reserved.length,
+            code: "LOCAL_OUT_OF_STOCK",
+          });
+          return await cancelCheckout(failureDetails);
+        }
+
+        orderItems.push({
+          tierId: item.tierId,
+          price: item.buyPrice,
+          quantity: item.requested,
+          provider: "local",
+          externalOrderId: null,
+          cards: reserved.map((card) => card._id),
+        });
+      }
+
+      // Step 4: handle bamboo items (use local inventory first, then Bamboo API)
+      for (const item of requestedItems.filter(
+        (entry) => entry.fulfillmentSource === "bamboo",
+      )) {
+        const localReserved = await reserveLocalCards(
+          item.tierId,
+          item.requested,
+        );
+        trackReserved(localReserved);
+
+        const remainingRequested = item.requested - localReserved.length;
+        let externalOrderId = null;
+        const bambooCreated = [];
+
+        if (remainingRequested > 0) {
+          if (!item.bambooProductId) {
+            failureDetails.push({
+              tierId: item.tierId,
+              requested: remainingRequested,
+              available: 0,
+              code: "PRODUCT_MISSING",
+            });
+            return await cancelCheckout(failureDetails);
+          }
+          if (
+            item.bambooValue === null ||
+            item.bambooValue === undefined ||
+            Number.isNaN(Number(item.bambooValue))
+          ) {
+            failureDetails.push({
+              tierId: item.tierId,
+              requested: remainingRequested,
+              available: 0,
+              code: "VALUE_INVALID",
+            });
+            return await cancelCheckout(failureDetails);
+          }
+
+          let bambooOrder;
+          try {
+            // Bamboo sequence: POST orders/checkout then GET orders/:id for cards.
+            bambooOrder = await placeAndResolveBambooOrder({
+              productId: item.bambooProductId,
+              value: item.bambooValue,
+              quantity: remainingRequested,
+              reference: `${user._id}:${item.tierId}:${Date.now()}`,
+              metadata: {
+                userId: user._id.toString(),
+                tierId: item.tierId.toString(),
+                tierTitle: item.tierTitle?.en || item.tierTitle?.ar || "",
+              },
+            });
+          } catch (err) {
+            if (err?.code === "BAMBOO_OUT_OF_STOCK") {
+              failureDetails.push({
+                tierId: item.tierId,
+                requested: remainingRequested,
+                available: Number(err.available ?? 0),
+                code: "OUT_OF_STOCK",
+                message: err.providerMessage || null,
+              });
+              return await cancelCheckout(failureDetails);
+            }
+            if (err?.code === "BAMBOO_INSUFFICIENT_FUNDS") {
+              // Provider account itself is short on funds, not a specific
+              // product being out of stock — flag it distinctly so ops can
+              // notice the account needs a top-up, but cancel the same way.
+              console.error(
+                "Bamboo account balance insufficient to fulfill order:",
+                err.providerMessage,
+              );
+              failureDetails.push({
+                tierId: item.tierId,
+                requested: remainingRequested,
+                available: 0,
+                code: "PROVIDER_OUT_OF_FUNDS",
+                message: err.providerMessage || null,
+              });
+              return await cancelCheckout(failureDetails);
+            }
+            throw err;
+          }
+
+          externalOrderId =
+            bambooOrder?.orderId || bambooOrder?.requestId || null;
+
+          const bambooCards = Array.isArray(bambooOrder?.cards)
+            ? bambooOrder.cards.slice(0, remainingRequested)
+            : [];
+          if (bambooCards.length < remainingRequested) {
+            failureDetails.push({
+              tierId: item.tierId,
+              requested: remainingRequested,
+              available: bambooCards.length,
+              code: "INCOMPLETE_ORDER",
+            });
+            return await cancelCheckout(failureDetails);
+          }
+
+          try {
+            for (const bambooCard of bambooCards) {
+              const createdCard = await createExternalCardDocument({
+                tierId: item.tierId,
+                userId: user._id,
+                bambooCard,
+                bambooOrderId: externalOrderId,
+              });
+              bambooCreated.push(createdCard);
+              trackReserved([createdCard]);
+            }
+          } catch (err) {
+            failureDetails.push({
+              tierId: item.tierId,
+              requested: remainingRequested,
+              available: 0,
+              code: "CARD_PERSIST_FAILED",
+            });
+            return await cancelCheckout(failureDetails);
+          }
+        }
+
+        const itemCardIds = [
+          ...localReserved.map((card) => card._id),
+          ...bambooCreated.map((card) => card._id),
+        ];
+
+        if (itemCardIds.length !== item.requested) {
+          failureDetails.push({
+            tierId: item.tierId,
+            requested: item.requested,
+            available: itemCardIds.length,
+            code: "INCOMPLETE_ORDER",
+          });
+          return await cancelCheckout(failureDetails);
+        }
+
+        orderItems.push({
+          tierId: item.tierId,
+          price: item.buyPrice,
+          quantity: item.requested,
+          provider:
+            localReserved.length > 0
+              ? bambooCreated.length > 0
+                ? "local"
+                : "local"
+              : "bamboo",
+          externalOrderId,
+          cards: itemCardIds,
+        });
+      }
+    }
+
+    // Step 5: finalize checkout (create order, charge balance, record
+    // transaction). These three writes are one financial fact and are
+    // committed together where the deployment allows it - see
+    // utils/dbTransaction.js for why that is conditional.
+    //
+    // Card reservation deliberately stays *outside* this transaction. Bamboo
+    // fulfilment calls an external provider whose purchases cannot be rolled
+    // back, so those cards must survive a failed checkout as unsold inventory
+    // rather than vanishing with an aborted transaction. releaseReservedCards
+    // is the compensating action for that half.
+    let savedOrder = null;
+    let balanceAfter = null;
+    let balanceBefore = null;
+
+    try {
+      const { transactional } = await withTransaction(async (session) => {
+        // withTransaction may retry the callback, so every attempt starts from
+        // a clean slate rather than reusing documents built by a prior one.
+        const sessionOpt = session ? { session } : {};
+
+        const order = new Order({
+          userId: user._id,
+          checkoutKey,
+          totalAmount: totalCost,
+          items: orderItems,
+        });
+        savedOrder = await order.save(sessionOpt);
+
+        // Charge the wallet with a single conditional, atomic update rather
+        // than writing back a total derived from the balance read at the top
+        // of this request. The old read-check-then-write let two checkouts
+        // that overlapped in time both pass the Step 2 affordability check and
+        // both persist a balance computed from the same stale figure - so the
+        // second one's spend was silently dropped and the buyer received both
+        // orders' cards while only being charged for one. The `$gte` guard
+        // re-checks affordability against the committed balance at the instant
+        // of the write, so exactly one of any set of racing checkouts wins.
+        const chargedUser = await User.findOneAndUpdate(
+          { _id: user._id, balance: { $gte: totalCost } },
+          { $inc: { balance: -totalCost } },
+          { new: true, ...sessionOpt },
+        );
+
+        if (!chargedUser) {
+          // Balance spent by a concurrent checkout/transfer since Step 2.
+          throw Object.assign(new Error("USER_BALANCE_INSUFFICIENT"), {
+            checkoutFailure: "USER_BALANCE_INSUFFICIENT",
+          });
+        }
+
+        balanceAfter = roundToCents(chargedUser.balance);
+        balanceBefore = roundToCents(balanceAfter + totalCost);
+
+        // Without a transaction the debit above has already landed on its own,
+        // so from here the buyer has paid and the cards are theirs - a later
+        // failure must not hand them back to the pool. Under a transaction the
+        // debit is still provisional, so the flag waits for the commit.
+        if (!session) {
+          checkoutCommitted = true;
+        }
+
+        const transaction = new Transaction({
+          userId: user._id,
+          type: "purchase",
+          amount: totalCost,
+          balanceBefore,
+          balanceAfter,
+          orderId: savedOrder._id,
+        });
+        await transaction.save(sessionOpt);
+      });
+
+      checkoutCommitted = true;
+
+      if (!transactional) {
+        // Fallback mode only: the order, the debit and the ledger entry landed
+        // as three independent writes, so a crash between them can leave the
+        // account inconsistent. Worth knowing about in the logs.
+        console.warn(
+          "[checkout] committed without a transaction (standalone MongoDB)",
+          { orderId: String(savedOrder._id), userId: String(user._id) },
+        );
+      }
+    } catch (err) {
+      if (err?.checkoutFailure === "USER_BALANCE_INSUFFICIENT") {
+        // Under a transaction the order was rolled back with the debit; in
+        // fallback mode it was already persisted and has to be removed so its
+        // checkoutKey is freed and the client may legitimately retry. The
+        // delete is a harmless no-op in the transactional case.
+        if (savedOrder?._id) {
+          await Order.deleteOne({ _id: savedOrder._id });
+        }
+        await releaseReservedCards();
+        return res.status(400).json({ code: "USER_BALANCE_INSUFFICIENT" });
+      }
+
+      if (err?.code === 11000) {
+        // Another request with the same checkoutKey finished this checkout
+        // concurrently (the race this key exists to prevent) — release
+        // what we reserved here and replay the winning request's result
+        // instead of charging the user twice.
+        await releaseReservedCards();
+        const winningOrder = await Order.findOne({
+          userId: user._id,
+          checkoutKey,
+        });
+        if (winningOrder) {
+          const payload = await buildCheckoutSuccessResponse(
+            winningOrder,
+            user.balance,
+          );
+          return res.status(201).json(payload);
+        }
+      }
+
+      throw err;
+    }
+
+    // Best-effort: update the persistent sold-cards stats counters. These
+    // must not be derived by counting live Card/Order documents, since sold
+    // cards are purged after the admin-configured retention window. Recorded
+    // only once the charge has actually committed, so an order that was rolled
+    // back above never inflates the counters.
+    try {
+      await Promise.all(
+        requestedItems.map((item) =>
+          recordCardSale({
+            typeId: item.typeId,
+            delta: item.requested,
+          }),
+        ),
+      );
+    } catch (statsError) {
+      console.error("Failed to record card sale stats:", statsError);
+    }
+
+    const payload = await buildCheckoutSuccessResponse(
+      savedOrder,
+      balanceAfter,
+    );
+    return res.status(201).json(payload);
+  } catch (err) {
+    try {
+      await releaseReservedCards();
+    } catch (releaseError) {
+      // Best effort rollback for unexpected errors.
+    }
+    return handleError(err, res);
+  }
+};
+
+export const getOrders = async (req, res) => {
+  try {
+    const { page, limit } = parsePagination(req.query.page, req.query.limit);
+    const filter = { userId: req.user.id };
+
+    const [orders, total] = await Promise.all([
+      populateOrderQuery(
+        Order.find(filter)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit),
+      ),
+      Order.countDocuments(filter),
+    ]);
+
+    const payload = orders.map((order) => {
+      const orderObj = order.toObject();
+      const items = Array.isArray(orderObj.items) ? orderObj.items : [];
+
+      return {
+        _id: orderObj._id,
+        totalAmount: orderObj.totalAmount,
+        createdAt: orderObj.createdAt,
+        items: items.map((item) => serializeOrderItem(item)),
+      };
+    });
+
+    const totalPages = Math.ceil(total / limit);
+    return res.status(200).json({
+      orders: payload,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasMore: page < totalPages,
+      },
+    });
+  } catch (err) {
+    return handleError(err, res);
+  }
+};
+
+export const getOrderById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.user) {
+      return res.status(403).json({ code: "AUTH_USER_REQUIRED" });
+    }
+    const order = await populateOrderQuery(
+      Order.findOne({
+        _id: id,
+        userId: req.user.id,
+      }),
+    );
+
+    if (!order) {
+      return res.status(404).json({ code: "ORDER_NOT_FOUND" });
+    }
+
+    const orderObj = order.toObject();
+    const items = Array.isArray(orderObj.items) ? orderObj.items : [];
+
+    const payload = {
+      _id: orderObj._id,
+      totalAmount: orderObj.totalAmount,
+      createdAt: orderObj.createdAt,
+      items: items.map((item) =>
+        serializeOrderItem(item, { includeCards: true }),
+      ),
+    };
+
+    return res.status(200).json(payload);
+  } catch (err) {
+    return handleError(err, res);
+  }
+};
