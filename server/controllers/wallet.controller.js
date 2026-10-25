@@ -55,6 +55,15 @@ const creditWalletForPayment = async ({
     return { balance: user?.balance ?? null, alreadyCredited: true };
   }
 
+  const paymentMethod = await PaymentMethod.findById(claimed.paymentMethodId)
+    .select("fee")
+    .lean();
+  const feeRate = Number(paymentMethod?.fee ?? 0);
+  const creditedAmount =
+    Number.isFinite(feeRate) && feeRate > 0
+      ? roundToCents(Number(claimed.amount) * (1 - feeRate))
+      : roundToCents(Number(claimed.amount));
+
   // Credit with an atomic $inc rather than reading the balance and writing a
   // sum derived from it. A top-up completing while the same user has a
   // checkout or an outgoing transfer in flight would otherwise persist a total
@@ -62,7 +71,7 @@ const creditWalletForPayment = async ({
   // whichever of the two writes landed second.
   const user = await User.findOneAndUpdate(
     { _id: claimed.userId },
-    { $inc: { balance: claimed.amount } },
+    { $inc: { balance: creditedAmount } },
     { new: true },
   );
 
@@ -80,12 +89,12 @@ const creditWalletForPayment = async ({
   }
 
   const balanceAfter = roundToCents(user.balance);
-  const balanceBefore = roundToCents(balanceAfter - claimed.amount);
+  const balanceBefore = roundToCents(balanceAfter - creditedAmount);
 
   const transaction = new Transaction({
     userId: user._id,
     type: "gateway_deposit",
-    amount: claimed.amount,
+    amount: creditedAmount,
     balanceBefore,
     balanceAfter,
     paymentRef: claimed.customRef,
@@ -186,7 +195,10 @@ const reconcileEzonePayment = async (payment) => {
     console.error(
       "[wallet] Ezone Pay payment amount mismatch",
       payment.customRef,
-      { expected: payment.amount, got: transaction.amount ?? transaction.Amount },
+      {
+        expected: payment.amount,
+        got: transaction.amount ?? transaction.Amount,
+      },
     );
     return payment.status;
   }
@@ -277,9 +289,7 @@ export const openTopup = async (req, res) => {
       providerMethodId <= 0 ||
       paymentMethod.isOnline === false
     ) {
-      return res
-        .status(409)
-        .json({ code: "WALLET_TOPUP_METHOD_UNAVAILABLE" });
+      return res.status(409).json({ code: "WALLET_TOPUP_METHOD_UNAVAILABLE" });
     }
 
     let parsedAmount;
@@ -312,6 +322,53 @@ export const openTopup = async (req, res) => {
         return res
           .status(400)
           .json({ code: "WALLET_TOPUP_AMOUNT_OUT_OF_RANGE" });
+      }
+    }
+
+    const dailyLimit = Number(paymentMethod.dailyLimit);
+    if (Number.isFinite(dailyLimit) && dailyLimit > 0) {
+      const feeRate = Number(paymentMethod.fee ?? 0);
+      const netAmount =
+        Number.isFinite(feeRate) && feeRate > 0
+          ? parsedAmount * (1 - feeRate)
+          : parsedAmount;
+
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
+
+      const [totals] = await PaynetPayment.aggregate([
+        {
+          $match: {
+            userId: req.user._id,
+            paymentMethodId: paymentMethod._id,
+            status: "paid",
+            createdAt: { $gte: startOfDay },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalNetToday: {
+              $sum: {
+                $multiply: [
+                  "$amount",
+                  { $subtract: [1, paymentMethod.fee ?? 0] },
+                ],
+              },
+            },
+          },
+        },
+      ]);
+
+      const totalNetToday = Number(totals?.totalNetToday ?? 0);
+      const remainingDailyLimit = dailyLimit - totalNetToday;
+      if (netAmount > remainingDailyLimit) {
+        return res.status(400).json({
+          code: "WALLET_TOPUP_DAILY_LIMIT_EXCEEDED",
+          dailyLimit,
+          remainingDailyLimit,
+          totalNetToday,
+        });
       }
     }
 
@@ -483,16 +540,14 @@ export const cancelTopup = async (req, res) => {
     }
 
     if (payment.status === "pending") {
-      await PaynetPayment.updateOne(
-        { _id: payment._id, status: "pending" },
-        { status: "expired" },
-      );
+      await PaynetPayment.findOneAndDelete({
+        _id: payment._id,
+        status: "pending",
+      });
     }
-    const updatedPayment = await PaynetPayment.findById(payment._id);
 
     return res.status(200).json({
       paymentRef: payment.customRef,
-      status: updatedPayment?.status ?? "expired",
     });
   } catch (err) {
     return handleError(err, res);
@@ -577,7 +632,9 @@ export const handleEzoneWebhook = async (req, res) => {
     Number(payload.event) !== 2 ||
     String(payload.transactionType || "").toLowerCase() !== "online"
   ) {
-    return res.status(200).json({ received: true, ignored: "unsupported_event" });
+    return res
+      .status(200)
+      .json({ received: true, ignored: "unsupported_event" });
   }
 
   const orderReference = String(payload.orderReference || "");
@@ -586,7 +643,9 @@ export const handleEzoneWebhook = async (req, res) => {
     return res.status(400).json({ code: "WEBHOOK_PAYLOAD_INVALID" });
   }
   if (!orderReference) {
-    return res.status(200).json({ received: true, ignored: "no_order_reference" });
+    return res
+      .status(200)
+      .json({ received: true, ignored: "no_order_reference" });
   }
 
   try {
@@ -595,7 +654,9 @@ export const handleEzoneWebhook = async (req, res) => {
       provider: "ezone",
     });
     if (!payment) {
-      return res.status(200).json({ received: true, ignored: "unknown_reference" });
+      return res
+        .status(200)
+        .json({ received: true, ignored: "unknown_reference" });
     }
 
     await creditWalletForPayment({

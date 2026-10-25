@@ -20,10 +20,10 @@ const authErrorResponses = {
 };
 
 export const openApiSpec = {
-  openapi: "1.0.0",
+  openapi: "3.0.0",
   info: {
     title: "Bayo Card API",
-    version: "2.0.0",
+    version: "1.0.0",
     description: [
       "An API for business partners integrating with Bayo Card: browse the card catalog and place orders. Bayo Card issues your integration an API key; send it as a `Bearer` token in the `Authorization` header on every request. There is no server-side cart — build one on your side as a list of `{ tierId, quantity }` and only call the API when you're ready to check out.",
       "",

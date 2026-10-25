@@ -17,8 +17,11 @@ const paymentMethodSchema = new Schema(
     amountEnabled: { type: Boolean, default: true },
     minDeposit: { type: Number, min: 0 },
     maxDeposit: { type: Number, default: null, min: 0 },
+    dailyLimit: { type: Number, default: null, min: 0 },
     // Required only when amountEnabled is false.
     fixedAmount: { type: Number, min: 0 },
+    note: { type: String, default: null },
+    fee: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true },
 );
@@ -35,6 +38,14 @@ paymentMethodSchema.pre("validate", function () {
     this.maxDeposit <= this.minDeposit
   ) {
     throw new Error("PAYMENT_METHOD_MAX_MUST_EXCEED_MIN");
+  }
+
+  if (
+    this.dailyLimit !== undefined &&
+    this.dailyLimit !== null &&
+    !Number.isFinite(this.dailyLimit)
+  ) {
+    throw new Error("PAYMENT_METHOD_DAILY_LIMIT_INVALID");
   }
 });
 
